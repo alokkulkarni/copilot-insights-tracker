@@ -1,0 +1,415 @@
+# Image Scanning Workflow
+# Scanners: Trivy + Grype + Docker Scout
+# Triggers: push to main + weekly Monday 07:00 UTC + manual dispatch
+# Email reports to: kulkarni.alok@gmail.com via SMTP
+# Fails on new CRITICAL CVEs vs n-1 run
+# Reports committed to .github/reports/image-scans/YYYY-MM-DD/
+
+name: Image Scan
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # Weekly on Monday at 07:00 UTC
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to scan (default: latest)'
+        required: false
+        default: 'latest'
+
+# Minimal global permissions
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/alokkulkarni/copilot-insights-tracker
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Trivy Image Scan
+  # SARIF uploaded to Security tab
+  # JSON saved for n-1 comparison
+  # ─────────────────────────────────────────────
+  trivy-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write   # required to upload SARIF to Security tab
+      packages: read            # required to pull from GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Determine image tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy image scan (SARIF)
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'   # Comparison job decides whether to fail
+
+      - name: Run Trivy image scan (JSON for n-1 comparison)
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          format: 'json'
+          output: 'trivy-image-results.json'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3.27.5
+        if: always()
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+          category: 'trivy-image'
+
+      - name: Upload Trivy scan artifacts
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: trivy-scan-${{ github.run_id }}
+          path: |
+            trivy-image-results.sarif
+            trivy-image-results.json
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Job 2: Grype Image Scan
+  # SARIF uploaded to Security tab
+  # ─────────────────────────────────────────────
+  grype-scan:
+    name: Grype Image Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write   # required to upload SARIF to Security tab
+      packages: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Determine image tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Grype image scan (SARIF)
+        uses: anchore/scan-action@v5.3.0
+        id: grype-sarif
+        with:
+          image: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          output-format: sarif
+          severity-cutoff: high
+          fail-build: false   # Comparison job decides whether to fail
+
+      - name: Run Grype image scan (JSON)
+        uses: anchore/scan-action@v5.3.0
+        id: grype-json
+        with:
+          image: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          output-format: json
+          severity-cutoff: high
+          fail-build: false
+
+      - name: Upload Grype SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3.27.5
+        if: always()
+        with:
+          sarif_file: ${{ steps.grype-sarif.outputs.sarif }}
+          category: 'grype-image'
+
+      - name: Upload Grype scan artifacts
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: grype-scan-${{ github.run_id }}
+          path: |
+            ${{ steps.grype-sarif.outputs.sarif }}
+            ${{ steps.grype-json.outputs.json }}
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Job 3: Docker Scout Policy Evaluation
+  # ─────────────────────────────────────────────
+  docker-scout:
+    name: Docker Scout Policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Determine image tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Scout CVE scan
+        uses: docker/scout-action@v1.15.1
+        with:
+          command: cves
+          image: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          only-severities: critical,high
+          exit-code: false   # Comparison job decides whether to fail
+          output: scout-results.sarif
+          format: sarif
+
+      - name: Upload Scout results artifact
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: scout-scan-${{ github.run_id }}
+          path: scout-results.sarif
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Job 4: Consolidate, Compare n-1, Email Report
+  # Fails if new CRITICAL CVEs found vs previous run
+  # ─────────────────────────────────────────────
+  consolidate-and-report:
+    name: Consolidate Reports & Notify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [trivy-scan, grype-scan, docker-scout]
+    if: always()
+    permissions:
+      contents: write   # required to commit consolidated report
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0   # required for rebase retry on report push
+
+      - name: Determine image tag
+        # Must re-derive tag here since this job runs independently
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download Trivy results
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: trivy-scan-${{ github.run_id }}
+          path: /tmp/trivy
+
+      - name: Download Grype results
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: grype-scan-${{ github.run_id }}
+          path: /tmp/grype
+        continue-on-error: true   # Grype may fail on some images — don't block report
+
+      - name: Download Scout results
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: scout-scan-${{ github.run_id }}
+          path: /tmp/scout
+        continue-on-error: true   # Scout may fail on some images — don't block report
+
+      - name: Count CRITICAL and HIGH CVEs from Trivy JSON
+        id: count-cves
+        run: |
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          if [ -f "/tmp/trivy/trivy-image-results.json" ]; then
+            CRITICAL_COUNT=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('/tmp/trivy/trivy-image-results.json'))
+              count = sum(
+                  1 for r in data.get('Results', [])
+                  for v in r.get('Vulnerabilities', [])
+                  if v.get('Severity') == 'CRITICAL'
+              )
+              print(count)
+          except Exception:
+              print(0)
+          " 2>/dev/null || echo "0")
+            HIGH_COUNT=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('/tmp/trivy/trivy-image-results.json'))
+              count = sum(
+                  1 for r in data.get('Results', [])
+                  for v in r.get('Vulnerabilities', [])
+                  if v.get('Severity') == 'HIGH'
+              )
+              print(count)
+          except Exception:
+              print(0)
+          " 2>/dev/null || echo "0")
+          fi
+          echo "CRITICAL_COUNT=${CRITICAL_COUNT}" >> "$GITHUB_ENV"
+          echo "HIGH_COUNT=${HIGH_COUNT}" >> "$GITHUB_ENV"
+          echo "Trivy found ${CRITICAL_COUNT} CRITICAL and ${HIGH_COUNT} HIGH CVEs"
+
+      - name: Compare against n-1 scan report
+        id: compare
+        run: |
+          REPORT_BASE=".github/reports/image-scans"
+          PREV_REPORT=$(find "${REPORT_BASE}" -name 'scan-summary.json' 2>/dev/null | sort | tail -1)
+          NEW_CRITICALS=0
+
+          if [ -n "${PREV_REPORT}" ]; then
+            PREV_CRITICAL=$(grep -oP '"critical_count":\s*\K[0-9]+' "${PREV_REPORT}" || echo "0")
+            CURR_CRITICAL="${{ env.CRITICAL_COUNT }}"
+            echo "Previous CRITICAL count: ${PREV_CRITICAL}"
+            echo "Current  CRITICAL count: ${CURR_CRITICAL}"
+
+            if [ "${CURR_CRITICAL}" -gt "${PREV_CRITICAL}" ]; then
+              NEW_CRITICALS=$((CURR_CRITICAL - PREV_CRITICAL))
+              echo "NEW_CRITICALS=${NEW_CRITICALS}" >> "$GITHUB_ENV"
+              echo "SCAN_REGRESSION=true" >> "$GITHUB_ENV"
+              echo "WARNING: ${NEW_CRITICALS} new CRITICAL CVE(s) found vs previous scan"
+            else
+              echo "NEW_CRITICALS=0" >> "$GITHUB_ENV"
+              echo "SCAN_REGRESSION=false" >> "$GITHUB_ENV"
+              echo "No new CRITICAL CVEs vs previous scan"
+            fi
+          else
+            echo "No previous scan report found — skipping comparison"
+            echo "NEW_CRITICALS=0" >> "$GITHUB_ENV"
+            echo "SCAN_REGRESSION=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Commit consolidated scan report
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          REPORT_DIR=".github/reports/image-scans/${DATE}"
+          mkdir -p "${REPORT_DIR}"
+
+          [ -d "/tmp/trivy" ] && cp -r /tmp/trivy/. "${REPORT_DIR}/"
+          [ -d "/tmp/grype" ] && cp -r /tmp/grype/. "${REPORT_DIR}/"
+          [ -d "/tmp/scout" ] && cp -r /tmp/scout/. "${REPORT_DIR}/"
+
+          cat > "${REPORT_DIR}/scan-summary.json" << EOF
+          {
+            "run_id": "${{ github.run_id }}",
+            "image": "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}",
+            "sha": "${{ github.sha }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "critical_count": ${{ env.CRITICAL_COUNT }},
+            "high_count": ${{ env.HIGH_COUNT }},
+            "new_criticals_vs_prev": ${{ env.NEW_CRITICALS }},
+            "scan_regression": ${{ env.SCAN_REGRESSION }},
+            "trivy_job": "${{ needs.trivy-scan.result }}",
+            "grype_job": "${{ needs.grype-scan.result }}",
+            "scout_job": "${{ needs.docker-scout.result }}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${REPORT_DIR}"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "scan: image scan report ${DATE} [skip ci]"
+
+            for attempt in 1 2 3; do
+              if git push; then
+                echo "Push succeeded on attempt ${attempt}"
+                break
+              fi
+              echo "Push failed (attempt ${attempt}/3) — rebasing and retrying"
+              git pull --rebase origin main || true
+            done
+          fi
+
+      - name: Send email report via SMTP
+        if: always()
+        uses: dawidd6/action-send-mail@v3.12.0
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: >
+            [Image Scan] copilot-insights-tracker - ${{ env.CRITICAL_COUNT }} CRITICAL,
+            ${{ env.HIGH_COUNT }} HIGH CVEs - ${{ github.run_id }}
+          to: kulkarni.alok@gmail.com
+          from: ${{ secrets.SMTP_FROM }}
+          body: |
+            Image Scan Report - copilot-insights-tracker
+            =============================================
+            Date:       $(date -u +%Y-%m-%d)
+            Image:      ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            Commit SHA: ${{ github.sha }}
+            Run ID:     ${{ github.run_id }}
+
+            Results Summary
+            ---------------
+            CRITICAL CVEs : ${{ env.CRITICAL_COUNT }}
+            HIGH CVEs     : ${{ env.HIGH_COUNT }}
+            New vs prev   : ${{ env.NEW_CRITICALS }} new CRITICAL(s)
+            Regression    : ${{ env.SCAN_REGRESSION }}
+
+            Trivy job  : ${{ needs.trivy-scan.result }}
+            Grype job  : ${{ needs.grype-scan.result }}
+            Scout job  : ${{ needs.docker-scout.result }}
+
+            View full results in the GitHub Security tab:
+            https://github.com/${{ github.repository }}/security/code-scanning
+
+      - name: Fail on new CRITICAL CVEs vs n-1
+        if: env.SCAN_REGRESSION == 'true'
+        run: |
+          echo "FAILING: ${{ env.NEW_CRITICALS }} new CRITICAL CVE(s) detected vs previous scan."
+          exit 1

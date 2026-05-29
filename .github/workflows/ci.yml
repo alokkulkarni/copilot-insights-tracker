@@ -1,0 +1,388 @@
+# CI Workflow — copilot-insights-tracker
+# Image: ghcr.io/alokkulkarni/copilot-insights-tracker
+# Triggers: push/PR to main, develop, feature/**, fix/**
+# Jobs: lint-and-format → unit-tests → security-scan → docker-build-push → commit-reports
+#
+# Security controls (GHA-001 through GHA-030):
+#   - All action versions pinned
+#   - Minimal permissions per job (read-only global, write only where needed)
+#   - No plaintext secrets — all via ${{ secrets.* }} or ${{ vars.* }}
+#   - timeout-minutes on every job
+#   - retention-days on every upload-artifact
+#   - SBOM generated on docker-build-push (VAL-011)
+#   - Coverage threshold enforced via vitest.config.js (80%)
+#   - CVE fail-fast on CRITICAL and HIGH
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'fix/**'
+
+# Read-only global permissions — jobs override where needed
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/alokkulkarni/copilot-insights-tracker
+  NODE_VERSION: '20'
+  COVERAGE_THRESHOLD: 80
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Lint & Format
+  # ESLint on src/**/*.{js,jsx}
+  # ─────────────────────────────────────────────
+  lint-and-format:
+    name: Lint & Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Run ESLint
+        run: npm run lint
+
+  # ─────────────────────────────────────────────
+  # Job 2: Unit Tests & Coverage
+  # Vitest with v8 coverage provider
+  # Threshold: 80% statements/branches/functions/lines (vitest.config.js)
+  # ─────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests & Coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: lint-and-format
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Run tests with coverage
+        # vitest.config.js enforces 80% threshold — job fails if not met
+        # esbuild is disabled in vitest.config.js — Babel (via @vitejs/plugin-react)
+        # handles all JSX transforms, avoiding the esbuild native binary crash
+        # that occurs in Linux CI container environments (EPIPE / goroutine panic)
+        run: npm run test:coverage
+
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: coverage-report-${{ github.run_id }}
+          path: coverage/
+          retention-days: 90
+
+      - name: Upload coverage lcov for badge generation
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: coverage-lcov-${{ github.run_id }}
+          path: coverage/lcov.info
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Job 3: Security Scan
+  # CodeQL (JavaScript) + npm audit + Trivy FS
+  # Fails on CRITICAL and HIGH CVEs
+  # SARIF results uploaded to GitHub Security tab
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: lint-and-format
+    permissions:
+      contents: read
+      security-events: write   # required for CodeQL + Trivy SARIF upload
+      actions: read            # required for CodeQL to read workflow context
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: npm audit (fail on HIGH and CRITICAL)
+        run: npm audit --audit-level=high
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3.27.5
+        with:
+          languages: javascript
+
+      - name: Autobuild for CodeQL
+        uses: github/codeql-action/autobuild@v3.27.5
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3.27.5
+        with:
+          category: '/language:javascript'
+
+      - name: Run Trivy filesystem scan (fail on CRITICAL and HIGH)
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Upload Trivy FS SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3.27.5
+        if: always()   # upload even if Trivy found issues (so results appear in Security tab)
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+          category: 'trivy-filesystem'
+
+      - name: Upload security scan artifact
+        uses: actions/upload-artifact@v4.4.3
+        if: always()   # retain artifact even on scan failure for audit trail
+        with:
+          name: security-scan-${{ github.run_id }}
+          path: trivy-fs-results.sarif
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Job 4: Docker Build & Push
+  # Image: ghcr.io/alokkulkarni/copilot-insights-tracker
+  # Tags: sha-<short>, branch ref, semver, latest (main only)
+  # SBOM generated inline by buildx (VAL-011)
+  # Only runs on push events — skipped on PRs to avoid secret exposure
+  # ─────────────────────────────────────────────
+  docker-build-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [unit-tests, security-scan]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write   # required to push to GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.7.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags and labels)
+        id: meta
+        uses: docker/metadata-action@v5.5.1
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        id: build-push
+        uses: docker/build-push-action@v6.9.0
+        with:
+          context: .
+          file: ./Dockerfile.prod
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true   # VAL-011: SBOM generated by buildx for supply-chain security
+
+      - name: Record image digest
+        run: echo "IMAGE_DIGEST=${{ steps.build-push.outputs.digest }}" >> "$GITHUB_ENV"
+
+      - name: Upload build digest artifact
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: docker-build-digest-${{ github.run_id }}
+          path: ${{ steps.meta.outputs.bake-file }}
+          retention-days: 90
+        # continue-on-error: bake-file may be empty for non-bake builds — artifact upload
+        # will silently succeed with an empty file, which is acceptable
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────
+  # Job 5: Commit Dated Reports + Coverage Badge
+  # Runs only on push to main
+  # Commits coverage + security reports to .github/reports/YYYY-MM-DD/
+  # Updates coverage badge in README.md
+  # Single commit + push with rebase retry to avoid race conditions
+  # ─────────────────────────────────────────────
+  commit-reports:
+    name: Commit Dated Reports
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [unit-tests, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write   # required to commit reports and update README
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0   # full history required for rebase retry
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: coverage-report-${{ github.run_id }}
+          path: /tmp/coverage
+
+      - name: Download security scan report
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: security-scan-${{ github.run_id }}
+          path: /tmp/security
+        continue-on-error: true   # Trivy may have failed — still commit coverage report
+
+      - name: Stage dated reports
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          REPORT_DIR=".github/reports/${DATE}"
+          mkdir -p "${REPORT_DIR}/coverage"
+          cp -r /tmp/coverage/. "${REPORT_DIR}/coverage/"
+
+          # Stage security report only if it was downloaded successfully
+          if [ -d "/tmp/security" ] && [ "$(ls -A /tmp/security)" ]; then
+            mkdir -p "${REPORT_DIR}/security"
+            cp -r /tmp/security/. "${REPORT_DIR}/security/"
+          fi
+
+          echo "REPORT_DIR=${REPORT_DIR}" >> "$GITHUB_ENV"
+          echo "DATE=${DATE}" >> "$GITHUB_ENV"
+
+      - name: Extract coverage percentage from lcov
+        run: |
+          LINES_FOUND=$(grep -oP 'LF:\K[0-9]+' /tmp/coverage/lcov.info 2>/dev/null \
+            | awk '{s+=$1} END {print s+0}')
+          LINES_HIT=$(grep -oP 'LH:\K[0-9]+' /tmp/coverage/lcov.info 2>/dev/null \
+            | awk '{s+=$1} END {print s+0}')
+          if [ "${LINES_FOUND}" -gt "0" ]; then
+            COVERAGE_PCT=$(echo "scale=1; ${LINES_HIT} * 100 / ${LINES_FOUND}" | bc)
+          else
+            COVERAGE_PCT="N/A"
+          fi
+          echo "COVERAGE_PCT=${COVERAGE_PCT}" >> "$GITHUB_ENV"
+          echo "Coverage: ${COVERAGE_PCT}%"
+
+      - name: Update coverage badge in README
+        run: |
+          PCT="${{ env.COVERAGE_PCT }}"
+
+          # Select badge colour based on coverage level
+          if [ "${PCT}" = "N/A" ]; then
+            COLOR="lightgrey"
+          elif [ "$(echo "${PCT} >= 90" | bc -l)" = "1" ]; then
+            COLOR="brightgreen"
+          elif [ "$(echo "${PCT} >= 80" | bc -l)" = "1" ]; then
+            COLOR="green"
+          elif [ "$(echo "${PCT} >= 70" | bc -l)" = "1" ]; then
+            COLOR="yellow"
+          else
+            COLOR="red"
+          fi
+
+          BADGE_URL="https://img.shields.io/badge/coverage-${PCT}%25-${COLOR}"
+          BADGE_MD="![Coverage](${BADGE_URL})"
+
+          if [ -f "README.md" ]; then
+            if grep -q '!\[Coverage\]' README.md; then
+              sed -i "s|!\[Coverage\](https://img.shields.io/badge/coverage-[^)]*)|${BADGE_MD}|g" README.md
+            else
+              # Prepend badge on first line if none exists
+              sed -i "1s|^|${BADGE_MD}\n\n|" README.md
+            fi
+            echo "README_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "README.md not found — skipping badge update"
+            echo "README_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Commit all changes and push with rebase retry
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ env.REPORT_DIR }}"
+
+          # Only stage README if it exists
+          if [ "${{ env.README_EXISTS }}" = "true" ]; then
+            git add README.md
+          fi
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — skipping push"
+            exit 0
+          fi
+
+          git commit -m "ci: reports and coverage badge for ${{ env.DATE }} [skip ci]"
+
+          # Retry push up to 3 times with rebase to handle concurrent bot pushes
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}/3) — rebasing and retrying"
+            git pull --rebase origin main
+          done
+
+          echo "ERROR: Push failed after 3 attempts"
+          exit 1

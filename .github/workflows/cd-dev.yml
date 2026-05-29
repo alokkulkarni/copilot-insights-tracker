@@ -1,0 +1,170 @@
+# CD Workflow — dev environment
+# Image: ghcr.io/alokkulkarni/copilot-insights-tracker
+# Target: Docker Compose
+# Auto-deploy: on push to develop branch
+# Approval gate: none
+# Health check: none
+#
+# Security controls (GHA-001 through GHA-030):
+#   - All action versions pinned
+#   - Minimal permissions per job
+#   - No plaintext secrets
+#   - timeout-minutes on every job
+#   - retention-days on every upload-artifact
+#   - CBOM generated before rollout (VAL-012)
+#   - Rollback on deploy failure (scoped to deploy step only)
+#   - Dated deployment report committed to .github/reports/dev/YYYY-MM-DD/
+#   - Push with rebase retry to handle concurrent bot commits
+
+name: CD - dev
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy (e.g. sha-abc1234)'
+        required: false
+        default: 'latest'
+
+# Read-only global permissions
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/alokkulkarni/copilot-insights-tracker
+  ENVIRONMENT: dev
+
+jobs:
+  deploy-dev:
+    name: Deploy to dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: dev   # scopes secrets/vars to the dev GitHub Environment
+    permissions:
+      contents: write   # required to commit deployment report
+      packages: read    # required to pull from GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0   # full history required for rebase retry on report push
+
+      - name: Determine image tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_tag }}" ]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Generate CBOM for deployment image
+        # VAL-012: Component Bill of Materials generated before rollout
+        # exit-code 0 — informational, does not block deploy
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          format: 'cyclonedx'
+          output: 'cbom.cdx.json'
+          exit-code: '0'
+
+      - name: Upload CBOM artifact
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: cbom-dev-${{ github.run_id }}
+          path: cbom.cdx.json
+          retention-days: 90
+
+      - name: Record previous image tag for rollback
+        run: |
+          PREV_REPORT=$(find .github/reports/dev -name 'deployment.json' 2>/dev/null \
+            | sort | tail -2 | head -1)
+          if [ -n "${PREV_REPORT}" ]; then
+            PREV_TAG=$(grep -oP '"image":\s*"\K[^"]+' "${PREV_REPORT}" | sed 's/.*://')
+            echo "PREV_IMAGE_TAG=${PREV_TAG}" >> "$GITHUB_ENV"
+          else
+            echo "PREV_IMAGE_TAG=latest" >> "$GITHUB_ENV"
+          fi
+
+      - name: Deploy via Docker Compose
+        id: deploy
+        run: |
+          export IMAGE_TAG=${{ env.IMAGE_TAG }}
+          export IMAGE_NAME=${{ env.IMAGE_NAME }}
+          docker compose -f docker-compose.yml up -d --pull always
+        env:
+          VITE_GITHUB_TOKEN: ${{ secrets.VITE_GITHUB_TOKEN }}
+          VITE_GITHUB_ORG: ${{ secrets.VITE_GITHUB_ORG }}
+
+      - name: Rollback on deploy failure
+        # Scoped to the deploy step only — CBOM/pull failures do not trigger rollback
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          echo "Deploy failed — rolling back to ${{ env.PREV_IMAGE_TAG }}"
+          export IMAGE_TAG=${{ env.PREV_IMAGE_TAG }}
+          export IMAGE_NAME=${{ env.IMAGE_NAME }}
+          docker compose -f docker-compose.yml up -d --pull always
+        env:
+          VITE_GITHUB_TOKEN: ${{ secrets.VITE_GITHUB_TOKEN }}
+          VITE_GITHUB_ORG: ${{ secrets.VITE_GITHUB_ORG }}
+
+      - name: Commit deployment report
+        if: always()
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          REPORT_DIR=".github/reports/dev/${DATE}"
+          mkdir -p "${REPORT_DIR}"
+
+          [ -f "cbom.cdx.json" ] && cp cbom.cdx.json "${REPORT_DIR}/"
+
+          cat > "${REPORT_DIR}/deployment.json" << EOF
+          {
+            "environment": "dev",
+            "image": "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}",
+            "sha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "${{ job.status }}",
+            "prev_image_tag": "${{ env.PREV_IMAGE_TAG }}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${REPORT_DIR}"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "cd: dev deployment report ${DATE} [skip ci]"
+
+          # Retry push up to 3 times with rebase to handle concurrent bot commits
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}/3) — rebasing and retrying"
+            git pull --rebase origin develop 2>/dev/null \
+              || git pull --rebase origin main 2>/dev/null \
+              || true
+          done
+          echo "ERROR: Push failed after 3 attempts"
+          exit 1

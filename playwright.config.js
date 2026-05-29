@@ -1,0 +1,47 @@
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: 'html',
+  use: {
+    baseURL: 'http://localhost:4001',
+    trace: 'on-first-retry',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'firefox',
+      use: { ...devices['Desktop Firefox'] },
+    },
+    {
+      name: 'webkit',
+      use: { ...devices['Desktop Safari'] },
+    },
+    // Mobile viewports
+    {
+      name: 'Pixel 7',
+      use: { ...devices['Pixel 7'] },
+    },
+    {
+      name: 'iPhone 14',
+      use: { ...devices['iPhone 14'] },
+    },
+    {
+      name: 'iPad',
+      use: { ...devices['iPad (gen 7)'] },
+    },
+  ],
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:4001',
+    reuseExistingServer: true,
+    timeout: 30000,
+  },
+});

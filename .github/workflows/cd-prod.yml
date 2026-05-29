@@ -1,0 +1,190 @@
+# CD Workflow — prod environment
+# Image: ghcr.io/alokkulkarni/copilot-insights-tracker
+# Target: Docker Compose
+# Auto-deploy: NO — manual workflow_dispatch only
+# Approval gate: YES — configure in Settings -> Environments -> prod -> Required reviewers
+# Health check: none
+# Extra safety: confirmation string "deploy-to-prod" required at dispatch time
+#
+# Security controls (GHA-001 through GHA-030):
+#   - All action versions pinned
+#   - Minimal permissions per job
+#   - No plaintext secrets
+#   - timeout-minutes on every job
+#   - retention-days on every upload-artifact
+#   - CBOM generated before rollout (VAL-012)
+#   - Rollback on deploy failure (scoped to deploy step only)
+#   - Dated deployment report committed to .github/reports/prod/YYYY-MM-DD/
+#   - Push with rebase retry to handle concurrent bot commits
+
+name: CD - prod
+
+on:
+  # Production deploys are ALWAYS manual — no auto-trigger on push
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy (REQUIRED — e.g. sha-abc1234 or v1.2.3)'
+        required: true
+      confirm:
+        description: 'Type "deploy-to-prod" to confirm production deployment'
+        required: true
+
+# Read-only global permissions
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/alokkulkarni/copilot-insights-tracker
+  ENVIRONMENT: prod
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Validate confirmation string
+  # Prevents accidental production deployments
+  # ─────────────────────────────────────────────
+  validate-confirmation:
+    name: Validate Deployment Confirmation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: none
+
+    steps:
+      - name: Check confirmation string
+        run: |
+          if [ "${{ inputs.confirm }}" != "deploy-to-prod" ]; then
+            echo "ERROR: Confirmation string must be exactly 'deploy-to-prod'"
+            echo "Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+          echo "Confirmation validated."
+
+  # ─────────────────────────────────────────────
+  # Job 2: Deploy to prod
+  # Requires: validate-confirmation passes + GitHub Environment approval
+  # ─────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy to prod
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: validate-confirmation
+    # The 'prod' GitHub Environment MUST have required reviewers configured
+    # Settings -> Environments -> prod -> Required reviewers
+    environment: prod
+    permissions:
+      contents: write   # required to commit deployment report
+      packages: read    # required to pull from GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0   # full history required for rebase retry on report push
+
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Generate CBOM for deployment image
+        # VAL-012: Component Bill of Materials generated before rollout
+        # exit-code 0 — informational, does not block deploy
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          format: 'cyclonedx'
+          output: 'cbom.cdx.json'
+          exit-code: '0'
+
+      - name: Upload CBOM artifact
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: cbom-prod-${{ github.run_id }}
+          path: cbom.cdx.json
+          retention-days: 90
+
+      - name: Record previous image tag for rollback
+        run: |
+          PREV_REPORT=$(find .github/reports/prod -name 'deployment.json' 2>/dev/null \
+            | sort | tail -2 | head -1)
+          if [ -n "${PREV_REPORT}" ]; then
+            PREV_TAG=$(grep -oP '"image":\s*"\K[^"]+' "${PREV_REPORT}" | sed 's/.*://')
+            echo "PREV_IMAGE_TAG=${PREV_TAG}" >> "$GITHUB_ENV"
+          else
+            echo "PREV_IMAGE_TAG=latest" >> "$GITHUB_ENV"
+          fi
+
+      - name: Deploy via Docker Compose
+        id: deploy
+        run: |
+          export IMAGE_TAG=${{ env.IMAGE_TAG }}
+          export IMAGE_NAME=${{ env.IMAGE_NAME }}
+          docker compose -f docker-compose.yml up -d --pull always
+        env:
+          VITE_GITHUB_TOKEN: ${{ secrets.VITE_GITHUB_TOKEN }}
+          VITE_GITHUB_ORG: ${{ secrets.VITE_GITHUB_ORG }}
+
+      - name: Rollback on deploy failure
+        # Scoped to the deploy step only — CBOM/pull failures do not trigger rollback
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          echo "CRITICAL: Deploy failed — rolling back to ${{ env.PREV_IMAGE_TAG }}"
+          export IMAGE_TAG=${{ env.PREV_IMAGE_TAG }}
+          export IMAGE_NAME=${{ env.IMAGE_NAME }}
+          docker compose -f docker-compose.yml up -d --pull always
+        env:
+          VITE_GITHUB_TOKEN: ${{ secrets.VITE_GITHUB_TOKEN }}
+          VITE_GITHUB_ORG: ${{ secrets.VITE_GITHUB_ORG }}
+
+      - name: Commit deployment report
+        if: always()
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          REPORT_DIR=".github/reports/prod/${DATE}"
+          mkdir -p "${REPORT_DIR}"
+
+          [ -f "cbom.cdx.json" ] && cp cbom.cdx.json "${REPORT_DIR}/"
+
+          cat > "${REPORT_DIR}/deployment.json" << EOF
+          {
+            "environment": "prod",
+            "image": "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}",
+            "sha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "${{ job.status }}",
+            "prev_image_tag": "${{ env.PREV_IMAGE_TAG }}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${REPORT_DIR}"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "cd: prod deployment report ${DATE} [skip ci]"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}/3) — rebasing and retrying"
+            git pull --rebase origin main 2>/dev/null || true
+          done
+          echo "ERROR: Push failed after 3 attempts"
+          exit 1

@@ -1,0 +1,203 @@
+# Regression Tests Workflow
+# Triggers: after CD - staging completes; weekly Monday 07:00 UTC; manual dispatch
+# Command: npm run test:e2e (Playwright)
+# Base URL: derived from vars.STAGING_HEALTH_URL
+# Compares against n-1 results to detect regressions
+# Reports committed to .github/reports/regression/YYYY-MM-DD/
+
+name: Regression Tests
+
+on:
+  workflow_run:
+    workflows: ['CD - staging']
+    types:
+      - completed
+  schedule:
+    # Weekly on Monday at 07:00 UTC
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'Base URL to run regression tests against (optional)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment label for report (default: staging)'
+        required: false
+        default: 'staging'
+
+# Minimal global permissions
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  regression-tests:
+    name: Run Regression Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write   # required to commit regression reports
+      checks: write     # required to publish check results
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0   # required for rebase retry on report push
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Determine base URL and environment label
+        run: |
+          if [ -n "${{ inputs.base_url }}" ]; then
+            echo "BASE_URL=${{ inputs.base_url }}" >> "$GITHUB_ENV"
+            echo "TARGET_ENV=${{ inputs.environment }}" >> "$GITHUB_ENV"
+          elif [ -n "${{ vars.STAGING_HEALTH_URL }}" ]; then
+            # Strip /health suffix if present
+            BASE=$(echo "${{ vars.STAGING_HEALTH_URL }}" | sed 's|/health$||')
+            echo "BASE_URL=${BASE}" >> "$GITHUB_ENV"
+            echo "TARGET_ENV=staging" >> "$GITHUB_ENV"
+          else
+            echo "BASE_URL=http://localhost:4001" >> "$GITHUB_ENV"
+            echo "TARGET_ENV=staging" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run Playwright regression tests
+        # Capture exit code so we can compare against n-1 before deciding to fail
+        id: run-tests
+        run: |
+          npm run test:e2e
+          echo "TEST_EXIT_CODE=0" >> "$GITHUB_ENV"
+        continue-on-error: true   # n-1 comparison step decides whether to fail
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ env.BASE_URL }}
+          CI: true
+
+      - name: Capture test exit code
+        run: |
+          echo "TEST_EXIT_CODE=${{ steps.run-tests.outcome == 'success' && '0' || '1' }}" >> "$GITHUB_ENV"
+
+      - name: Check for JUnit XML output
+        if: always()
+        run: |
+          if [ -f "test-results/junit.xml" ]; then
+            echo "JUnit XML found at test-results/junit.xml"
+          else
+            echo "No JUnit XML found — add 'junit' to Playwright reporters in playwright.config.js if needed"
+          fi
+
+      - name: Upload regression test artifacts
+        uses: actions/upload-artifact@v4.4.3
+        if: always()
+        with:
+          name: regression-report-${{ github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 90
+
+      - name: Compare against n-1 regression report and commit
+        if: always()
+        run: |
+          ENV="${{ env.TARGET_ENV }}"
+          DATE=$(date -u +%Y-%m-%d)
+          REPORT_DIR=".github/reports/regression/${ENV}/${DATE}"
+          REPORT_BASE=".github/reports/regression/${ENV}"
+
+          # Determine current test outcome
+          CURR_OUTCOME="${{ steps.run-tests.outcome }}"
+
+          # Find the most recent previous report
+          PREV_REPORT=$(find "${REPORT_BASE}" -name 'regression-test.json' 2>/dev/null | sort | tail -1)
+          REGRESSION="false"
+
+          if [ -n "${PREV_REPORT}" ]; then
+            PREV_STATUS=$(grep -oP '"status":\s*"\K[^"]+' "${PREV_REPORT}" || echo "unknown")
+            echo "Previous run status: ${PREV_STATUS}"
+            echo "Current run outcome: ${CURR_OUTCOME}"
+
+            if [ "${PREV_STATUS}" = "success" ] && [ "${CURR_OUTCOME}" = "failure" ]; then
+              echo "REGRESSION DETECTED: Tests passed in previous run but failed now."
+              REGRESSION="true"
+            else
+              echo "No regression detected."
+            fi
+          else
+            echo "No previous report found — skipping regression comparison."
+          fi
+
+          echo "REGRESSION=${REGRESSION}" >> "$GITHUB_ENV"
+
+          # Commit report before potentially failing
+          mkdir -p "${REPORT_DIR}"
+
+          if [ -f "playwright-report/index.html" ]; then
+            cp playwright-report/index.html "${REPORT_DIR}/playwright-report.html"
+          fi
+
+          if [ -f "test-results/junit.xml" ]; then
+            cp test-results/junit.xml "${REPORT_DIR}/junit.xml"
+          fi
+
+          cat > "${REPORT_DIR}/regression-test.json" << EOF
+          {
+            "run_id": "${{ github.run_id }}",
+            "environment": "${ENV}",
+            "base_url": "${{ env.BASE_URL }}",
+            "sha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "${CURR_OUTCOME}",
+            "regression_detected": "${REGRESSION}",
+            "triggered_by": "${{ github.event_name }}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${REPORT_DIR}"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "test: regression test report ${ENV} ${DATE} [skip ci]"
+
+            for attempt in 1 2 3; do
+              if git push; then
+                echo "Push succeeded on attempt ${attempt}"
+                break
+              fi
+              echo "Push failed (attempt ${attempt}/3) — rebasing and retrying"
+              git pull --rebase origin main || true
+            done
+          fi
+
+      - name: Fail on test failure
+        # Fail the job if tests failed (whether regression or first-time failure)
+        if: steps.run-tests.outcome == 'failure'
+        run: |
+          if [ "${{ env.REGRESSION }}" = "true" ]; then
+            echo "FAILING: regression detected — tests passed in previous run but failed now."
+          else
+            echo "FAILING: tests failed (no previous run to compare against, or previous run also failed)."
+          fi
+          exit 1

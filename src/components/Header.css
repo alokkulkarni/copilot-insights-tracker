@@ -1,0 +1,243 @@
+/* ============================================================
+   Header
+   ============================================================ */
+.header {
+  background: var(--colour-surface);
+  border-bottom: 3px solid var(--colour-primary);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-shadow: var(--shadow-sm);
+}
+
+.header__inner {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 var(--space-lg);
+  height: 64px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-xl);
+}
+
+/* Logo */
+.header__logo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  text-decoration: none;
+  flex-shrink: 0;
+}
+
+.header__logo:hover {
+  text-decoration: none;
+}
+
+.header__logo-mark {
+  width: 36px;
+  height: 36px;
+  background: var(--colour-primary);
+  color: var(--colour-text-on-primary);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: var(--font-size-sm);
+  flex-shrink: 0;
+}
+
+.header__logo-text {
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  color: var(--colour-text-primary);
+  white-space: nowrap;
+}
+
+/* Desktop nav */
+.header__nav {
+  flex: 1;
+}
+
+.header__nav-list {
+  display: flex;
+  list-style: none;
+  gap: var(--space-xs);
+}
+
+.header__nav-link {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--colour-text-secondary);
+  text-decoration: none;
+  transition: all var(--transition-fast);
+  min-height: 44px;
+  white-space: nowrap;
+}
+
+.header__nav-link:hover {
+  color: var(--colour-primary);
+  background: var(--colour-surface-alt);
+  text-decoration: none;
+}
+
+.header__nav-link--active {
+  color: var(--colour-primary);
+  background: var(--colour-surface-alt);
+  font-weight: 600;
+}
+
+/* Actions */
+.header__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-shrink: 0;
+}
+
+.header__status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.header__status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.header__status--connected {
+  color: var(--colour-success);
+}
+
+.header__status--connected .header__status-dot {
+  background: var(--colour-success);
+}
+
+.header__status--disconnected {
+  color: var(--colour-text-muted);
+}
+
+.header__status--disconnected .header__status-dot {
+  background: var(--colour-text-muted);
+}
+
+.header__last-updated {
+  font-size: var(--font-size-xs);
+  color: var(--colour-text-muted);
+  white-space: nowrap;
+}
+
+.header__setup-btn {
+  font-size: var(--font-size-xs);
+  padding: var(--space-xs) var(--space-md);
+}
+
+/* Hamburger */
+.header__hamburger {
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  width: 44px;
+  height: 44px;
+  background: none;
+  border: none;
+  padding: var(--space-sm);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.header__hamburger span {
+  display: block;
+  width: 22px;
+  height: 2px;
+  background: var(--colour-text-primary);
+  border-radius: 2px;
+  transition: all var(--transition-fast);
+}
+
+.header__hamburger--open span:nth-child(1) {
+  transform: translateY(7px) rotate(45deg);
+}
+
+.header__hamburger--open span:nth-child(2) {
+  opacity: 0;
+}
+
+.header__hamburger--open span:nth-child(3) {
+  transform: translateY(-7px) rotate(-45deg);
+}
+
+/* Mobile nav */
+.header__mobile-nav {
+  display: none;
+  background: var(--colour-surface);
+  border-top: 1px solid var(--colour-border);
+  padding: var(--space-md);
+}
+
+.header__mobile-nav ul {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.header__mobile-link {
+  display: flex;
+  align-items: center;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  font-weight: 500;
+  color: var(--colour-text-secondary);
+  text-decoration: none;
+  min-height: 44px;
+  transition: all var(--transition-fast);
+}
+
+.header__mobile-link:hover,
+.header__mobile-link--active {
+  color: var(--colour-primary);
+  background: var(--colour-surface-alt);
+  text-decoration: none;
+}
+
+/* Responsive */
+@media (max-width: 1024px) {
+  .header__last-updated {
+    display: none;
+  }
+
+  /* Hide the actions bar (status + settings btn) on tablet — too cramped */
+  .header__actions {
+    display: none;
+  }
+
+  /* Show hamburger on tablet so settings is accessible via mobile menu */
+  .header__hamburger {
+    display: flex;
+    margin-left: auto;
+  }
+
+  .header__mobile-nav--open {
+    display: block;
+  }
+}
+
+@media (max-width: 768px) {
+  .header__nav {
+    display: none;
+  }
+}

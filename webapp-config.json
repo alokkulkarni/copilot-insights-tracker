@@ -1,0 +1,28 @@
+{
+  "project_name": "copilot-insights-tracker",
+  "brand_name": "Virgin Money",
+  "vertical": "corporate",
+  "primary_colour": "#E4003B",
+  "accent_colour": "#B8002E",
+  "background_colour": "#f5f6fa",
+  "logo_mode": "text",
+  "logo_text": "VM",
+  "nav_items": ["Overview", "Active Users", "Copilot Insights", "Reports"],
+  "hero_headline": "GitHub Copilot Insights",
+  "hero_subtitle": "Track Copilot usage, active users, and productivity metrics across your organisation.",
+  "cta_primary": "View Insights",
+  "cta_secondary": "Connect GitHub",
+  "chat_enabled": false,
+  "deploy_target": "both",
+  "dev_port": 4001,
+  "features_enabled": true,
+  "feature_items": [
+    "📊 Copilot Usage",
+    "👥 Active Users",
+    "💡 Suggestions Accepted",
+    "📈 Productivity Trends"
+  ],
+  "products_enabled": false,
+  "footer_text": "© 2026 Virgin Money. All rights reserved.",
+  "copyright_entity": "Virgin Money"
+}

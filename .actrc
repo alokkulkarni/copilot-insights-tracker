@@ -1,0 +1,8 @@
+# act local runner configuration
+# https://github.com/nektos/act
+
+# Use the full Ubuntu 24.04 image to match the workflow runner
+-P ubuntu-24.04=catthehacker/ubuntu:act-24.04
+
+# Store artifacts locally when running act
+--artifact-server-path /tmp/act-artifacts

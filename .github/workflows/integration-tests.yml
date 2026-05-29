@@ -1,0 +1,142 @@
+# Integration Tests Workflow
+# Triggers: after CD - staging completes successfully, or manual dispatch
+# Runner: Playwright (all browsers defined in playwright.config.js)
+# Reports committed to .github/reports/integration/YYYY-MM-DD/
+
+name: Integration Tests
+
+on:
+  workflow_run:
+    workflows: ['CD - staging']
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'Base URL to run integration tests against (optional)'
+        required: false
+        default: ''
+
+# Minimal global permissions
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  integration-tests:
+    name: Run Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Only run if the triggering workflow succeeded (or if manually dispatched)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write   # required to commit test reports
+      checks: write     # required to publish check results
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0   # required for rebase retry on report push
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Install Playwright browsers
+        # Install all browsers defined in playwright.config.js
+        run: npx playwright install --with-deps
+
+      - name: Determine base URL
+        run: |
+          if [ -n "${{ inputs.base_url }}" ]; then
+            echo "BASE_URL=${{ inputs.base_url }}" >> "$GITHUB_ENV"
+          elif [ -n "${{ vars.STAGING_HEALTH_URL }}" ]; then
+            # Strip /health suffix if present
+            BASE=$(echo "${{ vars.STAGING_HEALTH_URL }}" | sed 's|/health$||')
+            echo "BASE_URL=${BASE}" >> "$GITHUB_ENV"
+          else
+            echo "BASE_URL=http://localhost:4001" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run Playwright integration tests
+        run: npm run test:e2e
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ env.BASE_URL }}
+          CI: true
+
+      - name: Upload Playwright HTML report artifact
+        uses: actions/upload-artifact@v4.4.3
+        if: always()
+        with:
+          name: playwright-integration-report-${{ github.run_id }}
+          path: playwright-report/
+          retention-days: 90
+
+      - name: Upload test results artifact
+        uses: actions/upload-artifact@v4.4.3
+        if: always()
+        with:
+          name: integration-test-results-${{ github.run_id }}
+          path: test-results/
+          retention-days: 90
+
+      - name: Commit integration test report
+        if: always()
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          REPORT_DIR=".github/reports/integration/${DATE}"
+          mkdir -p "${REPORT_DIR}"
+
+          if [ -f "playwright-report/index.html" ]; then
+            cp playwright-report/index.html "${REPORT_DIR}/playwright-report.html"
+          fi
+
+          if [ -f "test-results/junit.xml" ]; then
+            cp test-results/junit.xml "${REPORT_DIR}/junit.xml"
+          fi
+
+          cat > "${REPORT_DIR}/integration-test.json" << EOF
+          {
+            "run_id": "${{ github.run_id }}",
+            "base_url": "${{ env.BASE_URL }}",
+            "sha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "${{ job.status }}",
+            "triggered_by": "${{ github.event_name }}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${REPORT_DIR}"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "test: integration test report ${DATE} [skip ci]"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Push succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}/3) — rebasing and retrying"
+            git pull --rebase origin main || true
+          done
+          echo "Push failed after 3 attempts"
+          exit 1
